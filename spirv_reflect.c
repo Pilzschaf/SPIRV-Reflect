@@ -126,6 +126,7 @@ typedef struct SpvReflectPrvDecorations {
   SpvReflectPrvNumberDecoration   location;
   SpvReflectPrvNumberDecoration   offset;
   SpvReflectPrvNumberDecoration   uav_counter_buffer;
+  SpvReflectPrvNumberDecoration   specialization_constant;
   SpvReflectPrvStringDecoration   semantic;
   uint32_t                        array_stride;
   uint32_t                        matrix_stride;
@@ -641,6 +642,7 @@ static SpvReflectResult ParseNodes(SpvReflectPrvParser* p_parser)
     p_parser->nodes[i].decorations.offset.value = (uint32_t)INVALID_VALUE;
     p_parser->nodes[i].decorations.uav_counter_buffer.value = (uint32_t)INVALID_VALUE;
     p_parser->nodes[i].decorations.built_in = (SpvBuiltIn)INVALID_VALUE;
+    p_parser->nodes[i].decorations.specialization_constant.value = (SpvBuiltIn)INVALID_VALUE;
   }
   // Mark source file id node
   p_parser->source_file_id = (uint32_t)INVALID_VALUE;
@@ -840,7 +842,12 @@ static SpvReflectResult ParseNodes(SpvReflectPrvParser* p_parser)
 
       case SpvOpSpecConstantTrue:
       case SpvOpSpecConstantFalse:
-      case SpvOpSpecConstant:
+      case SpvOpSpecConstant: {
+        CHECKED_READU32(p_parser, p_node->word_offset + 1, p_node->result_type_id);
+        CHECKED_READU32(p_parser, p_node->word_offset + 2, p_node->result_id);
+        p_node->is_type = true;
+      }
+      break;
       case SpvOpSpecConstantComposite:
       case SpvOpSpecConstantOp: {
         CHECKED_READU32(p_parser, p_node->word_offset + 1, p_node->result_type_id);
@@ -1354,6 +1361,7 @@ static SpvReflectResult ParseDecorations(SpvReflectPrvParser* p_parser)
         skip = true;
       }
       break;
+      case SpvDecorationSpecId:
       case SpvDecorationRelaxedPrecision:
       case SpvDecorationBlock:
       case SpvDecorationBufferBlock:
@@ -1501,6 +1509,13 @@ static SpvReflectResult ParseDecorations(SpvReflectPrvParser* p_parser)
         uint32_t word_offset = p_node->word_offset + member_offset+ 3;
         CHECKED_READU32(p_parser, word_offset, p_target_decorations->input_attachment_index.value);
         p_target_decorations->input_attachment_index.word_offset = word_offset;
+      }
+      break;
+
+      case SpvDecorationSpecId: {
+        uint32_t word_offset = p_node->word_offset + member_offset+ 3;
+        CHECKED_READU32(p_parser, word_offset, p_target_decorations->specialization_constant.value);
+        p_target_decorations->specialization_constant.word_offset = word_offset;
       }
       break;
 
@@ -1809,6 +1824,12 @@ static SpvReflectResult ParseType(
 
       case SpvOpTypeAccelerationStructureKHR: {
         p_type->type_flags |= SPV_REFLECT_TYPE_FLAG_EXTERNAL_ACCELERATION_STRUCTURE;
+      }
+      break;
+
+      case SpvOpSpecConstantTrue:
+      case SpvOpSpecConstantFalse:
+      case SpvOpSpecConstant: {
       }
       break;
     }
@@ -3378,6 +3399,66 @@ static SpvReflectResult ParseExecutionModes(
   return SPV_REFLECT_RESULT_SUCCESS;
 }
 
+static SpvReflectResult ParseSpecializationConstants(SpvReflectPrvParser* p_parser, SpvReflectShaderModule* p_module)
+{
+  p_module->specialization_constant_count = 0;
+  p_module->specialization_constants = NULL;
+  for (size_t i = 0; i < p_parser->node_count; ++i) {
+    SpvReflectPrvNode* p_node = &(p_parser->nodes[i]);
+    if (p_node->op == SpvOpSpecConstantTrue || p_node->op == SpvOpSpecConstantFalse || p_node->op == SpvOpSpecConstant) {
+      p_module->specialization_constant_count++;
+    }
+  }
+
+  if (p_module->specialization_constant_count == 0) {
+    return SPV_REFLECT_RESULT_SUCCESS;
+  }
+
+  p_module->specialization_constants = (SpvReflectSpecializationConstant*)calloc(p_module->specialization_constant_count, sizeof(SpvReflectSpecializationConstant));
+
+  uint32_t index = 0;
+
+  for (size_t i = 0; i < p_parser->node_count; ++i) {
+    SpvReflectPrvNode* p_node = &(p_parser->nodes[i]);
+    switch(p_node->op) {
+      default: continue;
+      case SpvOpSpecConstantTrue: {
+        p_module->specialization_constants[index].constant_type = SPV_REFLECT_SPECIALIZATION_CONSTANT_BOOL;
+        p_module->specialization_constants[index].default_value.int_bool_value = 1;
+      } break;
+      case SpvOpSpecConstantFalse: {
+        p_module->specialization_constants[index].constant_type = SPV_REFLECT_SPECIALIZATION_CONSTANT_BOOL;
+        p_module->specialization_constants[index].default_value.int_bool_value = 0;
+      } break;
+      case SpvOpSpecConstant: {
+        SpvReflectResult result = SPV_REFLECT_RESULT_SUCCESS;
+        uint32_t element_type_id = (uint32_t)INVALID_VALUE;
+        uint32_t default_value = 0;
+        IF_READU32(result, p_parser, p_node->word_offset + 1, element_type_id);
+        IF_READU32(result, p_parser, p_node->word_offset + 3, default_value);
+
+        SpvReflectPrvNode* p_next_node = FindNode(p_parser, element_type_id);
+
+        if (p_next_node->op == SpvOpTypeInt) {
+          p_module->specialization_constants[index].constant_type = SPV_REFLECT_SPECIALIZATION_CONSTANT_INT;
+        } else if (p_next_node->op == SpvOpTypeFloat) {
+          p_module->specialization_constants[index].constant_type = SPV_REFLECT_SPECIALIZATION_CONSTANT_FLOAT;
+       } else {
+          return SPV_REFLECT_RESULT_ERROR_PARSE_FAILED;
+        }
+        p_module->specialization_constants[index].default_value.int_bool_value = default_value; //bits are the same for int and float
+      } break;
+    }
+
+    p_module->specialization_constants[index].name = p_node->name;
+    p_module->specialization_constants[index].constant_id = p_node->decorations.specialization_constant.value;
+    p_module->specialization_constants[index].spirv_id = p_node->result_id;
+    index++;
+  }
+
+  return SPV_REFLECT_RESULT_SUCCESS;
+}
+
 static SpvReflectResult ParsePushConstantBlocks(
   SpvReflectPrvParser*    p_parser, 
   SpvReflectShaderModule* p_module)
@@ -3764,6 +3845,10 @@ static SpvReflectResult CreateShaderModule(
     SPV_REFLECT_ASSERT(result == SPV_REFLECT_RESULT_SUCCESS);
   }
   if (result == SPV_REFLECT_RESULT_SUCCESS) {
+    result = ParseSpecializationConstants(&parser, p_module);
+    SPV_REFLECT_ASSERT(result == SPV_REFLECT_RESULT_SUCCESS);
+  }
+  if (result == SPV_REFLECT_RESULT_SUCCESS) {
     result = ParseEntryPoints(&parser, p_module);
     SPV_REFLECT_ASSERT(result == SPV_REFLECT_RESULT_SUCCESS);
   }
@@ -3926,6 +4011,7 @@ void spvReflectDestroyShaderModule(SpvReflectShaderModule* p_module)
   }
   SafeFree(p_module->capabilities);
   SafeFree(p_module->entry_points);
+  SafeFree(p_module->specialization_constants);
 
   // Push constants
   for (size_t i = 0; i < p_module->push_constant_block_count; ++i) {
@@ -4191,6 +4277,36 @@ SpvReflectResult spvReflectEnumerateEntryPointInterfaceVariables(
   }
   else {
     *p_count = p_entry->interface_variable_count;
+  }
+
+  return SPV_REFLECT_RESULT_SUCCESS;
+}
+
+SpvReflectResult spvReflectEnumerateSpecializationConstants(
+  const SpvReflectShaderModule*      p_module,
+  uint32_t*                          p_count,
+  SpvReflectSpecializationConstant** pp_constants
+)
+{
+  if (IsNull(p_module)) {
+    return SPV_REFLECT_RESULT_ERROR_NULL_POINTER;
+  }
+  if (IsNull(p_count)) {
+    return SPV_REFLECT_RESULT_ERROR_NULL_POINTER;
+  }
+
+  if (IsNotNull(pp_constants)) {
+    if (*p_count != p_module->specialization_constant_count) {
+     return SPV_REFLECT_RESULT_ERROR_COUNT_MISMATCH;
+    }
+
+    for (uint32_t index = 0; index < *p_count; ++index) {
+      SpvReflectSpecializationConstant *p_const = &p_module->specialization_constants[index];
+      pp_constants[index] = p_const;
+    }
+  }
+  else {
+    *p_count = p_module->specialization_constant_count;
   }
 
   return SPV_REFLECT_RESULT_SUCCESS;
